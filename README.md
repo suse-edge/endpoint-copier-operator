@@ -9,14 +9,14 @@ You’ll need a Kubernetes cluster to run against. You can use [KIND](https://si
 Deploy the controller to the cluster
 
 ```sh
-make deploy
+helm install --create-namespace -n endpoint-copier-operator endpoint-copier-operator helm/endpoint-copier-operator
 ```
 
-### Undeploy controller
-UnDeploy the controller from the cluster:
+### Uninstall controller
+Uninstall the controller from the cluster:
 
 ```sh
-make undeploy
+helm -n endpoint-copier-operator uninstall endpoint-copier-operator
 ```
 
 ### How it works

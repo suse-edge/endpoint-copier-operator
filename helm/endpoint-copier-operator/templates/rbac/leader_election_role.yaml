@@ -3,13 +3,8 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   labels:
-    app.kubernetes.io/name: role
-    app.kubernetes.io/instance: leader-election-role
-    app.kubernetes.io/component: rbac
-    app.kubernetes.io/created-by: endpoint-copier-operator
-    app.kubernetes.io/part-of: endpoint-copier-operator
-    app.kubernetes.io/managed-by: kustomize
-  name: leader-election-role
+    {{- include "endpoint-copier-operator.labels" . | nindent 4 }}
+  name: {{ include "endpoint-copier-operator.fullname" . }}-leader-election
 rules:
 - apiGroups:
   - ""
