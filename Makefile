@@ -2,7 +2,7 @@
 # VERSION comes from the VERSION file
 VERSION := $(shell cat VERSION)
 # REGISTRY is the container registry where the operator images are stored
-REGISTRY ?= registry.opensuse.org/home/kzhelyazkov/endpoint-copier-operator-images/containerfile/suse/endpoint-copier-operator
+REGISTRY ?= registry.opensuse.org/isv/suse/edge/metallb/images/endpoint-copier-operator
 # Image URL to use all building/pushing image targets
 IMG ?= $(REGISTRY):$(VERSION)
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
