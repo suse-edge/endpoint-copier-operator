@@ -21,11 +21,13 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
@@ -58,15 +60,28 @@ type EndpointsReconciler struct {
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.15.0/pkg/reconcile
 func (r *EndpointsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := ctrl.Log.WithName("endpoints")
+	// Check if managed service is created
+	managedService := &corev1.Service{}
+	err := r.Get(ctx, client.ObjectKey{Namespace: r.ManagedEndpointNamespace, Name: r.ManagedEndpointName}, managedService)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.Info("Service is missing", "name", r.ManagedEndpointName, "namespace", r.ManagedEndpointNamespace)
+		} else {
+			logger.Error(err, "Could not get service", "name", r.ManagedEndpointName, "namespace", r.ManagedEndpointNamespace)
+			return reconcile.Result{}, err
+		}
 
-	// Fetch the Endpoints object
+		return reconcile.Result{}, nil
+	}
+
+	// Fetch default Endpoints object
 	endpoints := &corev1.Endpoints{}
-	if err := r.Get(ctx, req.NamespacedName, endpoints); err != nil {
-		return reconcile.Result{}, client.IgnoreNotFound(err)
+	if err := r.Get(ctx, client.ObjectKey{Namespace: r.DefaultEndpointNamespace, Name: r.DefaultEndpointName}, endpoints); err != nil {
+		return reconcile.Result{}, err
 	}
 
 	// update the endpoints
-	if err := r.syncEndpoints(ctx, logger, endpoints); err != nil {
+	if err := r.syncEndpoints(ctx, logger, endpoints, managedService); err != nil {
 		logger.Error(err, "error syncing endpoint")
 		return reconcile.Result{}, err
 	}
@@ -90,21 +105,48 @@ func (r *EndpointsReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				return e.Object.GetNamespace() == r.DefaultEndpointNamespace && e.Object.GetName() == r.DefaultEndpointName
 			},
 		})).
-		Complete(r)
+		Watches(&corev1.Service{}, &handler.EnqueueRequestForObject{}, builder.WithPredicates(predicate.Funcs{
+			CreateFunc: func(e event.CreateEvent) bool {
+				return e.Object.GetNamespace() == r.ManagedEndpointNamespace && e.Object.GetName() == r.ManagedEndpointName
+			},
+			UpdateFunc: func(e event.UpdateEvent) bool {
+				return e.ObjectOld.GetNamespace() == r.ManagedEndpointNamespace && e.ObjectOld.GetName() == r.ManagedEndpointName
+			},
+			DeleteFunc: func(e event.DeleteEvent) bool {
+				return e.Object.GetNamespace() == r.ManagedEndpointNamespace && e.Object.GetName() == r.ManagedEndpointName
+			},
+		})).Complete(r)
 }
 
 // syncEndpoint updates the Endpoint resource with the current node IPs.
-func (r *EndpointsReconciler) syncEndpoints(ctx context.Context, logger logr.Logger, defaultEndpoints *corev1.Endpoints) error {
+func (r *EndpointsReconciler) syncEndpoints(ctx context.Context, logger logr.Logger, defaultEndpoints *corev1.Endpoints, managedService *corev1.Service) error {
 	managedEndpoints := &corev1.Endpoints{}
 	managedEndpoints.ObjectMeta.Name = r.ManagedEndpointName
 	managedEndpoints.ObjectMeta.Namespace = r.ManagedEndpointNamespace
 	managedEndpoints.ObjectMeta.Labels = map[string]string{"endpointslice.kubernetes.io/managed-by": Name}
 
-	// Copy only subset addresses without the ports
 	managedEndpoints.Subsets = []corev1.EndpointSubset{}
 	for _, subset := range defaultEndpoints.Subsets {
-		subset.Ports = []corev1.EndpointPort{{Port: int32(r.ApiserverPort), Protocol: corev1.Protocol(r.ApiserverProtocol)}}
-		managedEndpoints.Subsets = append(managedEndpoints.Subsets, subset)
+		var copiedPorts []corev1.EndpointPort
+		for _, port := range managedService.Spec.Ports {
+			endpointPort := corev1.EndpointPort{
+				Name:     port.Name,
+				Port:     port.Port,
+				Protocol: port.Protocol,
+			}
+			copiedPorts = append(copiedPorts, endpointPort)
+		}
+
+		// Copy the addresses
+		copiedAddresses := make([]corev1.EndpointAddress, len(subset.Addresses))
+		copy(copiedAddresses, subset.Addresses)
+
+		newSubset := corev1.EndpointSubset{
+			Addresses: copiedAddresses,
+			Ports:     copiedPorts,
+		}
+
+		managedEndpoints.Subsets = append(managedEndpoints.Subsets, newSubset)
 	}
 
 	// Update the custom Endpoints resource with the updated IP addresses.

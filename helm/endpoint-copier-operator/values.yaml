@@ -53,12 +53,3 @@ nodeSelector: {}
 tolerations: []
 
 affinity: {}
-
-managedService:
-  name: kubernetes-vip
-  namespace: default
-  type: LoadBalancer
-  labels:
-    endpointslice.kubernetes.io/managed-by: endpoint-copier-operator
-  port: 6443
-  protocol: TCP
