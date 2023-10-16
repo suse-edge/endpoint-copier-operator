@@ -1,15 +1,39 @@
 # endpoint-copier-operator
-This is an Kubernetes operator whose purpose is to create a copy of the default Kubernetes Service (as LoadBalancer type) and Endpoint and to keep them synced.
+This is an Kubernetes operator whose purpose is to create a copy of a Kubernetes Service and Endpoint and to keep them synced.
 
 ## Getting Started
 You’ll need a Kubernetes cluster to run against. You can use [KIND](https://sigs.k8s.io/kind) to get a local cluster for testing, or run against a remote cluster.
 **Note:** Your controller will automatically use the current context in your kubeconfig file (i.e. whatever cluster `kubectl cluster-info` shows).
 
 ### Running on the cluster
-Deploy the controller to the cluster
+Deploy the controller to the cluster:
 
 ```sh
 helm install --create-namespace -n endpoint-copier-operator endpoint-copier-operator helm/endpoint-copier-operator
+```
+
+Create a Kubernetes Service:
+
+```sh
+cat <<-EOF | kubectl apply -f -
+apiVersion: v1
+kind: Service
+metadata:
+  name: kubernetes-vip
+  namespace: default
+spec:
+  internalTrafficPolicy: Cluster
+  ipFamilies:
+  - IPv4
+  ipFamilyPolicy: SingleStack
+  ports:
+  - name: https
+    port: 443
+    protocol: TCP
+    targetPort: 6443
+  sessionAffinity: None
+  type: LoadBalancer
+EOF
 ```
 
 ### Uninstall controller
