@@ -15,9 +15,6 @@ RUN go mod download
 COPY cmd/main.go cmd/main.go
 COPY internal/controller/ internal/controller/
 
-# Copy the manifests
-COPY config config
-
 # Copy version related files
 COPY hack hack
 COPY VERSION VERSION
@@ -35,7 +32,6 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -ldflags
 FROM gcr.io/distroless/static:nonroot
 WORKDIR /
 COPY --from=builder /workspace/manager .
-COPY --from=builder /workspace/config /config
 USER 65532:65532
 
 ENTRYPOINT ["/manager"]
