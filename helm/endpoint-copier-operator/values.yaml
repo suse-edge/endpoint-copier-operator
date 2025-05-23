@@ -29,6 +29,8 @@ podSecurityContext:
   seccompProfile:
     type: RuntimeDefault
 
+priorityClassName: "system-cluster-critical"
+
 securityContext:
   allowPrivilegeEscalation: false
   capabilities:
@@ -37,11 +39,11 @@ securityContext:
 
 resources:
   limits:
-    cpu: 500m
-    memory: 128Mi
-  requests:
-    cpu: 10m
+    cpu: 100m
     memory: 64Mi
+  requests:
+    cpu: 5m
+    memory: 32Mi
 
 autoscaling:
   enabled: false
