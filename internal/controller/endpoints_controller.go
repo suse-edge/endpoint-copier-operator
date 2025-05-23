@@ -23,18 +23,23 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 var (
 	// Name is the name of the operator
 	Name = "endpoint-copier-operator"
+
+	// Annotation used on services to enable endpoints syncing
+	ServiceAnnotationEnabled          = "endpoint-copier/enabled"
+	AnnotationDefaultServiceName      = "endpoint-copier/default-service-name"
+	AnnotationDefaultServiceNamespace = "endpoint-copier/default-service-namespace"
 )
 
 // EndpointsReconciler reconciles a Endpoints object
@@ -60,35 +65,75 @@ type EndpointsReconciler struct {
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.15.0/pkg/reconcile
 func (r *EndpointsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := ctrl.Log.WithName("endpoints")
-	// Check if managed service is created
-	managedService := &corev1.Service{}
-	err := r.Get(ctx, client.ObjectKey{Namespace: r.ManagedEndpointNamespace, Name: r.ManagedEndpointName}, managedService)
-	if err != nil {
+
+	// Fetch the Service that triggered the reconcile
+	svc := &corev1.Service{}
+	if err := r.Get(ctx, req.NamespacedName, svc); err != nil {
 		if apierrors.IsNotFound(err) {
-			logger.Info("Service is missing", "name", r.ManagedEndpointName, "namespace", r.ManagedEndpointNamespace)
-		} else {
-			logger.Error(err, "Could not get service", "name", r.ManagedEndpointName, "namespace", r.ManagedEndpointNamespace)
-			return reconcile.Result{}, err
+			logger.Info("Service not found", "name", req.Name, "namespace", req.Namespace)
+			return ctrl.Result{}, nil
 		}
-
-		return reconcile.Result{}, nil
+		logger.Error(err, "Failed to get Service")
+		return ctrl.Result{}, err
 	}
 
-	// Fetch default Endpoints object
+	annotations := svc.GetAnnotations()
+	enabled := annotations != nil && annotations[ServiceAnnotationEnabled] == "true"
+
+	var managedServiceName, managedServiceNamespace string
+	var defaultServiceName, defaultServiceNamespace string
+
+	if enabled {
+		// If annotation enabled: The managed service is the current Service itself
+		managedServiceName = svc.Name
+		managedServiceNamespace = svc.Namespace
+
+		// The default service is read from the annotations on the managed service
+		defaultServiceName = annotations[AnnotationDefaultServiceName]
+		defaultServiceNamespace = annotations[AnnotationDefaultServiceNamespace]
+
+		logger.Info("Annotation enabled: using dynamic managed and default services",
+			"managedServiceName", managedServiceName, "managedServiceNamespace", managedServiceNamespace,
+			"defaultServiceName", defaultServiceName, "defaultServiceNamespace", defaultServiceNamespace)
+	} else {
+		// Legacy mode fallback - use configured fixed names and namespaces
+		managedServiceName = r.ManagedEndpointName
+		managedServiceNamespace = r.ManagedEndpointNamespace
+
+		defaultServiceName = r.DefaultEndpointName
+		defaultServiceNamespace = r.DefaultEndpointNamespace
+
+		logger.Info("Annotation not enabled, using legacy static configuration — this behavior is DEPRECATED",
+			"managedServiceName", managedServiceName, "managedServiceNamespace", managedServiceNamespace,
+			"defaultServiceName", defaultServiceName, "defaultServiceNamespace", defaultServiceNamespace)
+	}
+
+	// Get the managed Service object
+	managedService := &corev1.Service{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: managedServiceNamespace, Name: managedServiceName}, managedService); err != nil {
+		if apierrors.IsNotFound(err) {
+			logger.Info("Managed Service not found", "name", managedServiceName, "namespace", managedServiceNamespace)
+			return ctrl.Result{}, nil
+		}
+		logger.Error(err, "Error getting managed service")
+		return ctrl.Result{}, err
+	}
+
+	// Get the default Endpoints object
 	endpoints := &corev1.Endpoints{}
-	if err := r.Get(ctx, client.ObjectKey{Namespace: r.DefaultEndpointNamespace, Name: r.DefaultEndpointName}, endpoints); err != nil {
-		return reconcile.Result{}, err
+	if err := r.Get(ctx, client.ObjectKey{Namespace: defaultServiceNamespace, Name: defaultServiceName}, endpoints); err != nil {
+		return ctrl.Result{}, err
 	}
 
-	// update the endpoints
+	// Sync endpoints from default to managed service
 	if err := r.syncEndpoints(ctx, logger, endpoints, managedService); err != nil {
-		logger.Error(err, "error syncing endpoint")
-		return reconcile.Result{}, err
+		logger.Error(err, "error syncing endpoints")
+		return ctrl.Result{}, err
 	}
 
-	logger.Info("Successfully updated endpoint", "name", r.ManagedEndpointName, "namespace", r.ManagedEndpointNamespace)
+	logger.Info("Successfully updated endpoint", "name", managedServiceName, "namespace", managedServiceNamespace)
 
-	return reconcile.Result{}, nil
+	return ctrl.Result{}, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -107,13 +152,13 @@ func (r *EndpointsReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		})).
 		Watches(&corev1.Service{}, &handler.EnqueueRequestForObject{}, builder.WithPredicates(predicate.Funcs{
 			CreateFunc: func(e event.CreateEvent) bool {
-				return e.Object.GetNamespace() == r.ManagedEndpointNamespace && e.Object.GetName() == r.ManagedEndpointName
+				return (e.Object.GetNamespace() == r.ManagedEndpointNamespace && e.Object.GetName() == r.ManagedEndpointName) || hasEndpointCopierEnabledAnnotation(e.Object)
 			},
 			UpdateFunc: func(e event.UpdateEvent) bool {
-				return e.ObjectOld.GetNamespace() == r.ManagedEndpointNamespace && e.ObjectOld.GetName() == r.ManagedEndpointName
+				return e.ObjectNew.GetNamespace() == r.ManagedEndpointNamespace && e.ObjectNew.GetName() == r.ManagedEndpointName || hasEndpointCopierEnabledAnnotation(e.ObjectNew)
 			},
 			DeleteFunc: func(e event.DeleteEvent) bool {
-				return e.Object.GetNamespace() == r.ManagedEndpointNamespace && e.Object.GetName() == r.ManagedEndpointName
+				return e.Object.GetNamespace() == r.ManagedEndpointNamespace && e.Object.GetName() == r.ManagedEndpointName || hasEndpointCopierEnabledAnnotation(e.Object)
 			},
 		})).Complete(r)
 }
@@ -121,17 +166,23 @@ func (r *EndpointsReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // syncEndpoint updates the Endpoint resource with the current node IPs.
 func (r *EndpointsReconciler) syncEndpoints(ctx context.Context, logger logr.Logger, defaultEndpoints *corev1.Endpoints, managedService *corev1.Service) error {
 	managedEndpoints := &corev1.Endpoints{}
-	managedEndpoints.ObjectMeta.Name = r.ManagedEndpointName
-	managedEndpoints.ObjectMeta.Namespace = r.ManagedEndpointNamespace
+	managedEndpoints.ObjectMeta.Name = managedService.Name
+	managedEndpoints.ObjectMeta.Namespace = managedService.Namespace
 	managedEndpoints.ObjectMeta.Labels = map[string]string{"endpointslice.kubernetes.io/managed-by": Name}
 
 	managedEndpoints.Subsets = []corev1.EndpointSubset{}
 	for _, subset := range defaultEndpoints.Subsets {
 		var copiedPorts []corev1.EndpointPort
 		for _, port := range managedService.Spec.Ports {
+			var portNumber int32
+			if port.TargetPort.Type == intstr.Int {
+				portNumber = port.TargetPort.IntVal
+			} else {
+				portNumber = port.Port
+			}
 			endpointPort := corev1.EndpointPort{
 				Name:     port.Name,
-				Port:     port.Port,
+				Port:     portNumber,
 				Protocol: port.Protocol,
 			}
 			copiedPorts = append(copiedPorts, endpointPort)
@@ -155,4 +206,14 @@ func (r *EndpointsReconciler) syncEndpoints(ctx context.Context, logger logr.Log
 	}
 
 	return nil
+}
+
+// helper func to check annotation
+func hasEndpointCopierEnabledAnnotation(obj client.Object) bool {
+	annotations := obj.GetAnnotations()
+	if annotations == nil {
+		return false
+	}
+	val, ok := annotations[ServiceAnnotationEnabled]
+	return ok && val == "true"
 }
