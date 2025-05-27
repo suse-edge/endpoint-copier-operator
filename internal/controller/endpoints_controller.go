@@ -1,19 +1,3 @@
-/*
-Copyright 2023.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package controller
 
 import (
@@ -21,8 +5,11 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -33,17 +20,13 @@ import (
 )
 
 var (
-	// Name is the name of the operator
-	Name = "endpoint-copier-operator"
-
-	// Annotation used on services to enable endpoints syncing
+	Name                              = "endpoint-copier-operator"
 	ServiceAnnotationEnabled          = "endpoint-copier/enabled"
 	AnnotationDefaultServiceName      = "endpoint-copier/default-service-name"
 	AnnotationDefaultServiceNamespace = "endpoint-copier/default-service-namespace"
 )
 
-// EndpointsReconciler reconciles a Endpoints object
-type EndpointsReconciler struct {
+type EndpointSliceReconciler struct {
 	client.Client
 	Scheme                   *runtime.Scheme
 	DefaultEndpointName      string
@@ -54,23 +37,35 @@ type EndpointsReconciler struct {
 	ApiserverProtocol        string
 }
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the Endpoints object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.15.0/pkg/reconcile
-func (r *EndpointsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	logger := ctrl.Log.WithName("endpoints")
+func (r *EndpointSliceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	logger := ctrl.Log.WithName("endpointslice")
 
-	// Fetch the Service that triggered the reconcile
 	svc := &corev1.Service{}
 	if err := r.Get(ctx, req.NamespacedName, svc); err != nil {
 		if apierrors.IsNotFound(err) {
-			logger.Info("Service not found", "name", req.Name, "namespace", req.Namespace)
+			logger.Info("Service not found, cleaning up EndpointSlices", "name", req.Name, "namespace", req.Namespace)
+
+			var slices discoveryv1.EndpointSliceList
+			err := r.List(ctx, &slices, client.InNamespace(req.Namespace), client.MatchingLabels{
+				"kubernetes.io/service-name": req.Name,
+			})
+			if err != nil {
+				logger.Error(err, "Failed to list EndpointSlices for cleanup")
+				return ctrl.Result{}, err
+			}
+
+			for _, slice := range slices.Items {
+				// Optional: only delete slices managed by your controller
+				if slice.Labels["endpoint-copier/source"] != "" {
+					if err := r.Delete(ctx, &slice); err != nil && !apierrors.IsNotFound(err) {
+						logger.Error(err, "Failed to delete EndpointSlice", "name", slice.Name)
+						// Don't return yet; continue trying to clean up others
+					} else {
+						logger.Info("Deleted EndpointSlice", "name", slice.Name)
+					}
+				}
+			}
+
 			return ctrl.Result{}, nil
 		}
 		logger.Error(err, "Failed to get Service")
@@ -84,70 +79,52 @@ func (r *EndpointsReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	var defaultServiceName, defaultServiceNamespace string
 
 	if enabled {
-		// If annotation enabled: The managed service is the current Service itself
 		managedServiceName = svc.Name
 		managedServiceNamespace = svc.Namespace
-
-		// The default service is read from the annotations on the managed service
 		defaultServiceName = annotations[AnnotationDefaultServiceName]
 		defaultServiceNamespace = annotations[AnnotationDefaultServiceNamespace]
-
-		logger.Info("Annotation enabled: using dynamic managed and default services",
-			"managedServiceName", managedServiceName, "managedServiceNamespace", managedServiceNamespace,
-			"defaultServiceName", defaultServiceName, "defaultServiceNamespace", defaultServiceNamespace)
 	} else {
-		// Legacy mode fallback - use configured fixed names and namespaces
 		managedServiceName = r.ManagedEndpointName
 		managedServiceNamespace = r.ManagedEndpointNamespace
-
 		defaultServiceName = r.DefaultEndpointName
 		defaultServiceNamespace = r.DefaultEndpointNamespace
-
-		logger.Info("Annotation not enabled, using legacy static configuration — this behavior is DEPRECATED",
-			"managedServiceName", managedServiceName, "managedServiceNamespace", managedServiceNamespace,
-			"defaultServiceName", defaultServiceName, "defaultServiceNamespace", defaultServiceNamespace)
 	}
 
-	// Get the managed Service object
 	managedService := &corev1.Service{}
 	if err := r.Get(ctx, client.ObjectKey{Namespace: managedServiceNamespace, Name: managedServiceName}, managedService); err != nil {
 		if apierrors.IsNotFound(err) {
-			logger.Info("Managed Service not found", "name", managedServiceName, "namespace", managedServiceNamespace)
+			logger.Info("Managed Service not found")
 			return ctrl.Result{}, nil
 		}
-		logger.Error(err, "Error getting managed service")
 		return ctrl.Result{}, err
 	}
 
-	// Get the default Endpoints object
-	endpoints := &corev1.Endpoints{}
-	if err := r.Get(ctx, client.ObjectKey{Namespace: defaultServiceNamespace, Name: defaultServiceName}, endpoints); err != nil {
+	var slices discoveryv1.EndpointSliceList
+	err := r.List(ctx, &slices, client.MatchingLabels{"kubernetes.io/service-name": defaultServiceName}, client.InNamespace(defaultServiceNamespace))
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// Sync endpoints from default to managed service
-	if err := r.syncEndpoints(ctx, logger, endpoints, managedService); err != nil {
-		logger.Error(err, "error syncing endpoints")
+	if err := r.syncEndpointSlices(ctx, logger, slices.Items, managedService); err != nil {
+		logger.Error(err, "Error syncing endpoint slices")
 		return ctrl.Result{}, err
 	}
 
-	logger.Info("Successfully updated endpoint", "name", managedServiceName, "namespace", managedServiceNamespace)
-
+	logger.Info("Successfully updated endpoint slices", "name", managedServiceName, "namespace", managedServiceNamespace)
 	return ctrl.Result{}, nil
 }
 
-// SetupWithManager sets up the controller with the Manager.
-func (r *EndpointsReconciler) SetupWithManager(mgr ctrl.Manager) error {
+func (r *EndpointSliceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&corev1.Endpoints{}, builder.WithPredicates(predicate.Funcs{
+		For(&discoveryv1.EndpointSlice{}, builder.WithPredicates(predicate.Funcs{
 			CreateFunc: func(e event.CreateEvent) bool {
-				return e.Object.GetNamespace() == r.DefaultEndpointNamespace && e.Object.GetName() == r.DefaultEndpointName
+				return e.Object.GetLabels()["kubernetes.io/service-name"] == r.DefaultEndpointName && e.Object.GetNamespace() == r.DefaultEndpointNamespace
 			},
 			UpdateFunc: func(e event.UpdateEvent) bool {
-				return e.ObjectOld.GetNamespace() == r.DefaultEndpointNamespace && e.ObjectOld.GetName() == r.DefaultEndpointName
+				return e.ObjectOld.GetLabels()["kubernetes.io/service-name"] == r.DefaultEndpointName && e.ObjectOld.GetNamespace() == r.DefaultEndpointNamespace
 			},
 			DeleteFunc: func(e event.DeleteEvent) bool {
-				return e.Object.GetNamespace() == r.DefaultEndpointNamespace && e.Object.GetName() == r.DefaultEndpointName
+				return e.Object.GetLabels()["kubernetes.io/service-name"] == r.DefaultEndpointName && e.Object.GetNamespace() == r.DefaultEndpointNamespace
 			},
 		})).
 		Watches(&corev1.Service{}, &handler.EnqueueRequestForObject{}, builder.WithPredicates(predicate.Funcs{
@@ -163,52 +140,50 @@ func (r *EndpointsReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		})).Complete(r)
 }
 
-// syncEndpoint updates the Endpoint resource with the current node IPs.
-func (r *EndpointsReconciler) syncEndpoints(ctx context.Context, logger logr.Logger, defaultEndpoints *corev1.Endpoints, managedService *corev1.Service) error {
-	managedEndpoints := &corev1.Endpoints{}
-	managedEndpoints.ObjectMeta.Name = managedService.Name
-	managedEndpoints.ObjectMeta.Namespace = managedService.Namespace
-	managedEndpoints.ObjectMeta.Labels = map[string]string{"endpointslice.kubernetes.io/managed-by": Name}
-
-	managedEndpoints.Subsets = []corev1.EndpointSubset{}
-	for _, subset := range defaultEndpoints.Subsets {
-		var copiedPorts []corev1.EndpointPort
+func (r *EndpointSliceReconciler) syncEndpointSlices(ctx context.Context, logger logr.Logger, sourceSlices []discoveryv1.EndpointSlice, managedService *corev1.Service) error {
+	for _, src := range sourceSlices {
+		copiedPorts := []discoveryv1.EndpointPort{}
 		for _, port := range managedService.Spec.Ports {
-			var portNumber int32
+			portNum := port.Port
 			if port.TargetPort.Type == intstr.Int {
-				portNumber = port.TargetPort.IntVal
-			} else {
-				portNumber = port.Port
+				portNum = port.TargetPort.IntVal
 			}
-			endpointPort := corev1.EndpointPort{
-				Name:     port.Name,
-				Port:     portNumber,
-				Protocol: port.Protocol,
-			}
-			copiedPorts = append(copiedPorts, endpointPort)
+			copiedPorts = append(copiedPorts, discoveryv1.EndpointPort{
+				Name:     &port.Name,
+				Port:     &portNum,
+				Protocol: &port.Protocol,
+			})
 		}
 
-		// Copy the addresses
-		copiedAddresses := make([]corev1.EndpointAddress, len(subset.Addresses))
-		copy(copiedAddresses, subset.Addresses)
-
-		newSubset := corev1.EndpointSubset{
-			Addresses: copiedAddresses,
-			Ports:     copiedPorts,
+		newSlice := &discoveryv1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      managedService.Name,
+				Namespace: managedService.Namespace,
+				Labels: map[string]string{
+					"kubernetes.io/service-name": managedService.Name,
+					"endpoint-copier/source":     src.Name,
+				},
+			},
+			AddressType: src.AddressType,
+			Endpoints:   src.Endpoints,
+			Ports:       copiedPorts,
 		}
 
-		managedEndpoints.Subsets = append(managedEndpoints.Subsets, newSubset)
-	}
+		newSlice.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "discovery.k8s.io",
+			Version: "v1",
+			Kind:    "EndpointSlice",
+		})
 
-	// Update the custom Endpoints resource with the updated IP addresses.
-	if err := r.Update(ctx, managedEndpoints); err != nil {
-		return err
+		// Upsert logic
+		err := r.Patch(ctx, newSlice, client.Apply, client.ForceOwnership, client.FieldOwner(Name))
+		if err != nil {
+			logger.Error(err, "Failed to patch EndpointSlice", "name", newSlice.Name)
+		}
 	}
-
 	return nil
 }
 
-// helper func to check annotation
 func hasEndpointCopierEnabledAnnotation(obj client.Object) bool {
 	annotations := obj.GetAnnotations()
 	if annotations == nil {
