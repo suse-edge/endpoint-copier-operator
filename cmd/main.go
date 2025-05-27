@@ -122,7 +122,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err = (&controller.EndpointsReconciler{
+	if err = (&controller.EndpointSliceReconciler{
 		Client:                   mgr.GetClient(),
 		Scheme:                   mgr.GetScheme(),
 		DefaultEndpointName:      defaultEndpointName,

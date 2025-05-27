@@ -21,6 +21,10 @@ kind: Service
 metadata:
   name: kubernetes-vip
   namespace: default
+  annotations:
+    endpoint-copier/enabled: "true"
+    endpoint-copier/default-service-name: "kubernetes"
+    endpoint-copier/default-service-namespace: "default"
 spec:
   internalTrafficPolicy: Cluster
   ipFamilies:
