@@ -1,7 +1,26 @@
 # endpoint-copier-operator
+
 This is a Kubernetes operator whose purpose is to keep the Endpoint Slices of a Kubernetes Service in sync with another Kubernetes Service.
 
-This is being used on the SUSE Edge product to expose the Kubernetes API on High Availability scenarios.
+It is used on the SUSE Edge and SUSE Telco cloud products to expose the Kubernetes API on High Available RKE2/K3s cluster deployments.
+
+### Why is it needed?
+As explained in [kubernetes documentation - Service without selector](https://kubernetes.io/docs/concepts/services-networking/service/#services-without-selectors), when a Service API object is created without specifying any "pod selector" (i.e., `.spec.selector` stanza is not set) the kubernetes built-in endpointslices controller does not create/manage the corresponding EndpointSlice API objects for it, so that/those must be created and handled "by someone else".
+This is the case for the "special" built-in `kubernetes` Service object in the `default` namespace: the (on purpose) missing "pod selector" makes the built-in endpointslices controller to ignore it.
+
+However an special "reconciler" running inside each apiserver instance takes care of managing the corresponding `kubernetes.default` EndpointSlice API object as follow:
+* the reconcilers create the corresponding `kubernetes` EndpointSlice object in the `default` namespace.
+* they populate the content of that managed EndpointSlice object only with the control-plane node's IPv4/IPv6 addresses of those available apiserver instances as reported through the associated `apiserver-<xxxxx>` Lease objects in `kube-system` namespace.
+* if one of those `apiserver-<xxxxx>` leases is not renewed on time by the apiserver instance holder, the other apiserver instances detect it and remove the faulty apiserver's IP address from the `kubernetes.default` EndpointSlice object.
+
+Note that using a pod selector for the `kubernetes.default` Service object would have raised a "chicken-and-egg" situation due to using the API server to detect the availabilty of the apiserver instances itself and so a solution like that was discarded by kubernetes architects in the early days.
+
+The same "chicken-and-egg" problem arises when aiming to expose the `kubernetes.default` endpoints outside a Kubernetes High Available cluster using a `type:LoadBalancer` Service object. An approach based on setting a "pod selector" in a defined LoadBalancer Service object that points to all the static kube-apiserver pods "running" in the control-plane nodes would fail as soon as experiencing availability/reachabilty issues in any control-plane node, as tried to be explained here below:
+* A node is marked unavailable when its kubelet fails to renew its Lease object before expiration. In the Kubernetes heartbeat mechanism, each node has a dedicated Lease object in the `kube-node-lease` namespace. Each kubelet must periodically renew the assigned lease via the API server; if it fails, the built-in nodes controller detects the expired lease and updates the Node object's status to Unknown or NotReady.
+* A kubelet not being able to renew its lease means it could not reach the API server before the lease timed-out for whatever reason: that kubelet daemon crashed and failed to be restarted, the apiserver instance(s) it tries to contact is (are) not reachable/availabe/running, etc.
+* Let's take one of the possible causes: a networking issue left that control-plane node isolated from the rest; the kubelet running in that node should now inform to the kubernetes control plane controllers (through the API server) that the apiserver instance running in that node is not reachable, setting the status of the static kube-apiserver pod representing that apiservice instance as "Not Ready" (for the built-in endpointslices controller to detect/watch it and automatically remove that IP address from the EndpointSlice object associated to the type=LoadBalancer Service object) ... but this is not possible to happen as that kubelet instance cannot reach the API server ! Again a chicken-and-egg deadlock due to trying to use the API server to report an apiserver instance availability issue ...
+
+To resolve these consistency issues, the _endpoint-copier-operator_ runs a dedicated reconciliation loop. Its primary job is to mirror the built-in `kubernetes.default` EndpointSlice object's list of endpoints into a managed `kubernetes-vip.default` EndpointSlice object. This managed EndpointSlice is linked to a manually created `kubernetes-vip.default` LoadBalancer Service object, providing a reliable bridge between the internal cluster discovery and the external load balancing infrastructure.
 
 ## Getting Started
 You’ll need a Kubernetes cluster to run against. You can use [KIND](https://sigs.k8s.io/kind) to get a local cluster for testing, or run against a remote cluster.
